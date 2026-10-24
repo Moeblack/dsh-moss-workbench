@@ -1,0 +1,48 @@
+{
+  "name": "dsh-moss-workbench",
+  "version": "1.0.0",
+  "description": "MOSS-Image 视觉分镜与异形拉框工作台 (abs_centralized yxyx 坐标引擎、一刀切分镜刀、四角变形框、漫画气泡图章与手绘草图桥接)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Moeblack/dsh-moss-workbench.git"
+  },
+  "type": "module",
+  "main": "lib/index.js",
+  "icon": "./icon.svg",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-api-remotes",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-sidebar-right",
+        "@deepseek-ai/dsh-client-ui-tool",
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  }
+}

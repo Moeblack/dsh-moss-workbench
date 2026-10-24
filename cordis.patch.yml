@@ -1,0 +1,4 @@
+- insert:
+    - id: dsh-moss-workbench
+      name: dsh-moss-workbench
+      config: {}
