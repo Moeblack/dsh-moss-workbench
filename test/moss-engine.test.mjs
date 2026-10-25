@@ -19,6 +19,9 @@ import {
   canvasSizeFromRatioAndMegapixels,
   matchCanvasAspectRatio,
   createDefaultWorkbenchState,
+  CAMERA_PRESETS, POSE_PRESETS, defaultCamera, normalizeCamera,
+  projectLayout3D, bakeCameraToItems, computeMannequinSkeleton3D,
+  normalizeMannequin, mirrorPose,
 } from "../src/core/moss-engine.js";
 
 test("canvas size separates all requested aspect ratios from a free MP budget", () => {
@@ -219,5 +222,100 @@ test("resizeWorkbenchCanvas proportionally scales all boxes and preserves relati
   assert.equal(resized.canvasHeight, 640);
   const afterBbox = getItemAABB(resized.items[0], 960, 640).mossBbox;
   assert.deepEqual(afterBbox, [-264, 121, 320, 480]);
+});
+
+const directorScene = () => ({
+  canvasWidth: 1536, canvasHeight: 1024, canvasMode: 'single', meta: [], palette: [],
+  globalCaption: 'A duel under moonlight.',
+  camera: { ...defaultCamera(), enabled: true }, strokes: [],
+  items: [
+    { id: 'hero', label: 'character', noteZh: '剑士', caption: 'A swordswoman.', points: rectToPoints(300, 150, 300, 700), body: { anchor: 'world', z: 1.4, thickness: .4, yaw: 0 }, mannequin: { enabled: true, type: 'Female' } },
+    { id: 'rival', label: 'character', noteZh: '对手', points: rectToPoints(900, 220, 240, 600), body: { anchor: 'world', z: 2.2, thickness: .4, yaw: 20 }, mannequin: { enabled: true, type: 'Male' } },
+    { id: 'title', label: 'text', noteZh: '月下决斗', points: rectToPoints(650, 40, 250, 80), body: { anchor: 'screen' } },
+  ],
+});
+
+test('director exposes all thirteen cameras and projects finite centered MOSS bounds', () => {
+  assert.equal(CAMERA_PRESETS.length, 13);
+  const state = directorScene(), unchanged = structuredClone(state);
+  const base = projectLayout3D(state);
+  for (const preset of CAMERA_PRESETS) {
+    const scene = projectLayout3D({ ...state, camera: preset.camera });
+    assert.equal(scene.order.length, state.items.length);
+    for (const p of Object.values(scene.items)) {
+      assert.ok(p.bbox.every(Number.isFinite));
+      assert.ok(p.bbox[0] >= 0 && p.bbox[2] <= 1536);
+      assert.ok(p.bbox[1] >= 0 && p.bbox[3] <= 1024);
+    }
+    assert.deepEqual(scene.items.title.bbox, base.items.title.bbox);
+  }
+  assert.notDeepEqual(projectLayout3D({ ...state, camera: CAMERA_PRESETS.find(p => p.id === 'right').camera }).items.hero.bbox, base.items.hero.bbox);
+  assert.deepEqual(state, unchanged);
+  const limited = normalizeCamera({ pitch: 999, roll: -999, fov: 0, distance: 9 });
+  assert.equal(limited.pitch, 85); assert.equal(limited.roll, -60);
+  assert.equal(limited.fov, 10); assert.equal(limited.distance, 5);
+});
+
+test('camera bake preserves projected skeleton and is strictly idempotent', () => {
+  const state = directorScene();
+  state.camera = { ...defaultCamera(), enabled: true, orbit: 18, pitch: -8, roll: 7 };
+  const before = projectLayout3D(state), baked = bakeCameraToItems(state), after = projectLayout3D(baked);
+  assert.deepEqual(bakeCameraToItems(baked), baked);
+  assert.deepEqual(baked.items.find(it => it.id === 'title').points, state.items.find(it => it.id === 'title').points);
+  for (const id of ['hero', 'rival']) {
+    const a = before.items[id].skeleton.joints, b = after.items[id].skeleton.joints;
+    for (const joint of Object.keys(a)) if (a[joint] && b[joint]) {
+      assert.ok(Math.abs(a[joint].x - b[joint].x) < .001, `${id} ${joint} x`);
+      assert.ok(Math.abs(a[joint].y - b[joint].y) < .001, `${id} ${joint} y`);
+    }
+    assert.ok(baked.items.find(it => it.id === id).body.source);
+  }
+});
+
+test('articulated FK has twelve poses, real depth, type proportions and hierarchical joint rotation', () => {
+  const state = directorScene(), hero = state.items[0];
+  assert.equal(POSE_PRESETS.length, 12);
+  const skeleton = computeMannequinSkeleton3D(hero, state);
+  for (const joint of ['head', 'neck', 'pelvis', 'l_elbow', 'r_wrist', 'l_knee', 'r_ankle']) assert.ok(skeleton.joints[joint].every(Number.isFinite));
+  assert.ok(skeleton.segments.length >= 16);
+  const moved = computeMannequinSkeleton3D({ ...hero, mannequin: { joints: { r_arm: { raise: 100 }, r_elbow: { bend: 80 } } } }, state);
+  assert.notDeepEqual(moved.joints.r_wrist, skeleton.joints.r_wrist);
+  assert.deepEqual(moved.joints.l_wrist, skeleton.joints.l_wrist);
+  assert.notEqual(moved.joints.r_wrist[2], skeleton.joints.r_wrist[2]);
+  assert.notDeepEqual(computeMannequinSkeleton3D({ ...hero, mannequin: { type: 'Child' } }, state).joints.head, skeleton.joints.head);
+  for (const preset of POSE_PRESETS) {
+    const projected = projectLayout3D({ ...state, items: [{ ...hero, mannequin: { preset: preset.id } }] }).items.hero.skeleton;
+    assert.ok(projected.bbox.every(Number.isFinite));
+    assert.ok(projected.head.outline.length > 3);
+    assert.ok(projected.segments.every(s => s.radius > 0 && s.a && s.b));
+  }
+  const pose = normalizeMannequin({ joints: { r_arm: { raise: 85, turn: 30 }, head: { turn: 45 } } });
+  assert.deepEqual(mirrorPose(mirrorPose(pose)), pose);
+  assert.equal(mirrorPose(pose).joints.l_arm.raise, 85);
+  assert.equal(mirrorPose(pose).joints.head.turn, -45);
+});
+
+test('weapons bind to left/right wrists and auto holder depth instead of floating screen-space', () => {
+  const state = directorScene();
+  for (const joint of ['l_wrist', 'r_wrist', 'auto']) {
+    const weapon = { id: 'blade', label: 'object', noteZh: '剑', points: rectToPoints(400, 400, 60, 240), body: { anchor: 'world', z: 7 }, attachment: { holderId: 'hero', joint } };
+    const projection = projectLayout3D({ ...state, items: [...state.items, weapon] });
+    assert.equal(projection.items.blade.attachment.holderId, 'hero');
+    if (joint !== 'auto') assert.equal(projection.items.blade.attachment.joint, joint);
+    const target = projection.worldSkeletons.hero.joints[projection.items.blade.attachment.joint];
+    const actual = projection.geometry.blade.center;
+    if (joint !== 'auto') assert.ok(Math.hypot(...actual.map((v, i) => v - target[i])) < .001);
+    else assert.ok(Math.abs(actual[2] - target[2]) < .001);
+  }
+  const automatic = { id: 'blade', label: 'object', points: rectToPoints(410, 400, 50, 240), body: { anchor: 'world', z: 7 } };
+  assert.equal(projectLayout3D({ ...state, items: [...state.items, automatic] }).items.blade.attachment.holderId, 'hero');
+});
+
+test('mannequin joint angles never compile into English pose captions', () => {
+  const state = directorScene(), before = compileMossBlueprint(state).mossJson;
+  const changed = { ...state, items: state.items.map(it => ({ ...it, mannequin: { preset: 'run', joints: { torso: { bend: 70 }, head: { turn: 90 } } } })) };
+  const after = compileMossBlueprint(changed).mossJson;
+  assert.equal(after.summary.caption, before.summary.caption);
+  assert.deepEqual(after.items.map(it => it.caption), before.items.map(it => it.caption));
 });
 

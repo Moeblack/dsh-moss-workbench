@@ -6,6 +6,8 @@ import {
   compileMossBlueprint, parseMossJsonToState, resizeWorkbenchCanvas,
 } from '../core/moss-engine.js';
 import { MOSS_WORKBENCH_CSS } from './styles.js';
+import { projectLayout3D, normalizeBody } from '../core/moss-3d.js';
+import { createDirector3DComponents, DIRECTOR_3D_CSS, drawMannequin2D } from './director-3d.js';
 import { DOCUMENTS_STORAGE_KEY, createDocumentStore, documentFingerprint, updateActiveDocument, saveActiveDocument, newDocument, switchDocument, closeDocument, renameDocument } from './document-store.js';
 
 const STORAGE_KEY = 'dsh-moss-workbench-state-v1';
@@ -23,7 +25,7 @@ const isTyping = target => !!target?.closest?.('input,textarea,select,[contented
 const pathFrom = (points, close = true) => points.length ? `M ${points.map(p => `${p.x},${p.y}`).join(' L ')}${close ? ' Z' : ''}` : '';
 const colorFor = item => item.color || COLORS[item.label] || COLORS.panel;
 const tailEnabled = item => item.label === 'text' && ['oval', 'burst'].includes(item.bubbleStyle);
-const baseState = () => ({ canvasWidth: 1024, canvasHeight: 1536, canvasMode: 'multi_panel', meta: [], palette: [], globalNoteZh: '', globalCaption: '', gutterWidth: 16, overlayImage: null, items: [], strokes: [] });
+const baseState = () => ({ canvasWidth: 1024, canvasHeight: 1536, canvasMode: 'multi_panel', viewportMode: '2d', meta: [], palette: [], globalNoteZh: '', globalCaption: '', gutterWidth: 16, overlayImage: null, items: [], strokes: [] });
 function normalizeState(input) {
   const state = { ...baseState(), ...input };
   state.canvasWidth = clamp(Number(state.canvasWidth) || 1024, 64, 8192);
@@ -145,6 +147,7 @@ export function renderWorkbenchToDataUrl(input) {
   }
   const unit = Math.max(1, canvas.width / 1024);
   const trace = points => { ctx.beginPath(); points.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)); ctx.closePath(); };
+  const projectedScene = projectLayout3D(state);
   const ordered = state.items.map((item, index) => ({ item, index })).sort((a, b) => Number(b.item.label === 'panel') - Number(a.item.label === 'panel'));
   for (const { item, index } of ordered) {
     if (item.hidden) continue;
@@ -157,11 +160,13 @@ export function renderWorkbenchToDataUrl(input) {
       ctx.beginPath(); ctx.arc(b.centerX + b.width * .24, b.yMax + 8 * unit, 5 * unit, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
       ctx.beginPath(); ctx.arc(b.centerX + b.width * .28, b.yMax + 22 * unit, 3 * unit, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
     }
+    const mannequinProjection = item.label === 'character' && item.mannequin?.enabled !== false ? projectedScene.items[item.id]?.skeleton : null;
+    if (mannequinProjection) drawMannequin2D(ctx, mannequinProjection, color);
     const font = Math.max(12, 14 * unit), pad = 6 * unit;
     ctx.font = `600 ${font}px 'Noto Sans SC','PingFang SC',sans-serif`; ctx.textBaseline = 'top';
     const geometry = describeShapeGeometry(item, state.canvasWidth, state.canvasHeight);
     const isPanel = item.label === 'panel';
-    const showTopNote = isPanel || wireframe;
+    const showTopNote = isPanel || wireframe || !!mannequinProjection;
     const title = `#${index + 1} ${LABELS[item.label]}${item.roleTag ? ` · ${item.roleTag}` : ''}${geometry.isIrregular ? ` · ${geometry.badgeZh}` : ''}${showTopNote && item.noteZh ? ` — ${item.noteZh}` : ''}`;
     const badge = (text, x, y, right = false, bg = color, fg = '#fff') => {
       const maxWidth = Math.max(30, b.width - 8 * unit), tw = Math.min(ctx.measureText(text).width + pad * 2, maxWidth), bh = font + pad * 2;
@@ -201,6 +206,7 @@ export const renderWorkbenchSnapshotDataUrl = renderWorkbenchToDataUrl;
 
 export function createMossWorkbenchComponents({ React, syncStateToServer, insertIntoComposer, openWorkbenchTab }) {
   const h = React.createElement;
+  const { DirectorStage, DirectorProperties, MannequinOverlay } = createDirector3DComponents(React);
   const { useState, useEffect, useRef, useMemo, useCallback } = React;
   let history = { past: [], present: defaultState(), future: [] };
   let storageWarning = '', revision = -1, groupKey = '', groupTime = 0, activeGestureCount = 0;
@@ -304,7 +310,7 @@ export function createMossWorkbenchComponents({ React, syncStateToServer, insert
     const documentDirty = activeDocument.savedFingerprint !== documentFingerprint(state);
     const [styleTagDraft, setStyleTagDraft] = useState('');
     const [propertiesTab, setPropertiesTab] = useState('selection'), [layersTab, setLayersTab] = useState('layers');
-    useEffect(() => { if (selectedId) setPropertiesTab('selection'); }, [selectedId]);
+    useEffect(() => { if (selectedId && propertiesTab !== 'director') setPropertiesTab('selection'); }, [selectedId]);
     useEffect(() => { rootRef.current?.querySelector('.moss-wb-document-tabs [aria-selected=true]')?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' }); }, [activeDocument.id]);
     useEffect(() => {
       function fileShortcut(event) {
@@ -330,6 +336,25 @@ export function createMossWorkbenchComponents({ React, syncStateToServer, insert
     const [peekOriginal, setPeekOriginal] = useState(false);
     const [, setOverlayLoadedTick] = useState(0);
     const live = draft || state, selected = live.items.find(item => item.id === selectedId), narrow = width <= 760;
+    const projectedScene = useMemo(() => projectLayout3D(live), [live]);
+    const directorProps = { state: live, selectedItemId: selectedId, onSelect: id => { setSelectedId(id); setQuickOpen(false); }, onChange: next => {
+      if (next.camera?.enabled && next.camera.liveSync !== false) {
+        // Freeze the editable 3D source before writing its projected 2D AABB.
+        // Otherwise each live slider tick would refit a new, larger mannequin.
+        next = { ...next, items: next.items.map(item => {
+          const body = normalizeBody(item.body, item, next);
+          if (body.anchor !== 'world' || body.source) return item;
+          const b = bounds(item, next);
+          return { ...item, body: { ...body, source: { bbox: [b.xMin, b.yMin, b.xMax, b.yMax], z: body.z } } };
+        }) };
+        const projection = projectLayout3D(next);
+        next = { ...next, items: next.items.map(item => {
+          const p = projection.items[item.id];
+          return p?.anchor === 'world' && p.visible ? { ...item, points: p.points } : item;
+        }) };
+      }
+      commit(next, 'director-3d');
+    }, onGestureStart: () => { activeGestureCount++; }, onGestureEnd: () => { activeGestureCount = Math.max(0, activeGestureCount - 1); } };
     const compiled = useMemo(() => { try { return compileMossBlueprint(state); } catch (e) { return { mossJsonString: '{}', agentPromptMarkdown: '', warnings: [], error: e.message }; } }, [state]);
     const lint = useMemo(() => { try { return validateMossLayout(state); } catch (e) { return [{ id: 'invalid', title: '布局无法校验', message: e.message }]; } }, [state]);
     const notify = useCallback(message => { setToast(message); clearTimeout(toastTimer.current); toastTimer.current = setTimeout(() => setToast(''), 4200); }, []);
@@ -693,7 +718,8 @@ export function createMossWorkbenchComponents({ React, syncStateToServer, insert
       const ov = live.overlayImage;
       const wireframe = !!(ov && ov.visible !== false && ov.wireframe !== false);
       const isPanel = item.label === 'panel';
-      const showTopNote = isPanel || wireframe;
+      const mannequinProjection = item.label === 'character' && item.mannequin?.enabled !== false ? projectedScene.items[item.id]?.skeleton : null;
+      const showTopNote = isPanel || wireframe || !!mannequinProjection;
       const title = `#${index + 1} ${LABELS[item.label]}${item.roleTag ? ` · ${item.roleTag}` : ''}${geometry.isIrregular ? ` · ${geometry.badgeZh}` : ''}${showTopNote && item.noteZh ? ` — ${item.noteZh}` : ''}`;
       const coord = `[y:${b.mossBbox[0]}, x:${b.mossBbox[1]}, y:${b.mossBbox[2]}, x:${b.mossBbox[3]}]`;
       const coordsWidth = Math.min(b.width - 6 * unit, coord.length * small * .61 + 8 * unit);
@@ -711,6 +737,7 @@ export function createMossWorkbenchComponents({ React, syncStateToServer, insert
         tail.length ? h('path', { d: pathFrom(tail), fill: wireframe ? '#fffbeb44' : '#fffbeb', stroke: color, strokeWidth: 2 * unit, strokeLinejoin: 'round' }) : null,
         h('path', { d: pathFrom(shape), fill: wireframe ? `${color}08` : (item.label === 'text' ? '#fffbeb' : `${color}12`), stroke: color, strokeWidth: (item.id === selectedId ? 3.2 : wireframe ? 2.6 : 2) * unit, strokeLinejoin: 'round' }),
         item.label === 'text' && item.bubbleStyle === 'thought' ? h('g', { fill: '#fffbeb', stroke: color, strokeWidth: unit }, h('circle', { cx: b.centerX + b.width * .24, cy: b.yMax + 8 * unit, r: 5 * unit }), h('circle', { cx: b.centerX + b.width * .28, cy: b.yMax + 22 * unit, r: 3 * unit })) : null,
+        mannequinProjection ? h(MannequinOverlay, { state: live, projection: projectedScene, item, selectedItemId: selectedId }) : null,
         h('g', { className: 'moss-wb-label' },
           h('rect', { x: b.xMin + 2 * unit, y: b.yMin + 2 * unit, width: Math.max(0, titleWidth), height: fontSize + pad * 2, rx: 3 * unit, fill: color }),
           h('text', { x: b.xMin + 6 * unit, y: b.yMin + fontSize + pad, fontSize, fontWeight: 650, fill: '#fff', textLength: titleWidth > 0 ? Math.min(Array.from(title).length * fontSize * .7 - 6 * unit, titleWidth - 8 * unit) : undefined, lengthAdjust: 'spacingAndGlyphs' }, title),
@@ -753,14 +780,16 @@ export function createMossWorkbenchComponents({ React, syncStateToServer, insert
       const showOverlay = !!(ov && ov.visible !== false && ov.dataUrl);
       return h('section', { className: 'moss-wb-canvas-column', 'aria-label': '交互画板', onDragOver: event => { if (event.dataTransfer?.types?.includes?.('Files')) event.preventDefault(); }, onDrop: event => { const file = event.dataTransfer?.files?.[0]; if (file && file.type?.startsWith('image/')) { event.preventDefault(); loadOverlayFromFile(file); } } },
         renderDocumentTabs(),
-        h('div', { className: 'moss-wb-canvas-stage' }, renderOverlayHud(), h('div', { className: 'moss-wb-canvas-wrap', ref: wrapRef, style: { aspectRatio: `${state.canvasWidth}/${state.canvasHeight}`, width: `min(calc(100cqw - 56px), calc((100cqh - 96px) * ${state.canvasWidth / state.canvasHeight}))` } },
+        h('div', { className: 'moss-wb-viewports', 'data-mode': state.viewportMode || '2d' },
+          state.viewportMode !== '2d' && state.viewportMode ? h(DirectorStage, directorProps) : null,
+          state.viewportMode !== '3d' ? h('div', { className: 'moss-wb-canvas-stage' }, renderOverlayHud(), h('div', { className: 'moss-wb-canvas-wrap', ref: wrapRef, style: { aspectRatio: `${state.canvasWidth}/${state.canvasHeight}`, width: `min(calc(100cqw - 56px), calc((100cqh - 96px) * ${state.canvasWidth / state.canvasHeight}))` } },
           h('svg', { ref: svgRef, className: 'moss-wb-svg', 'data-tool': tool, xmlns: 'http://www.w3.org/2000/svg', viewBox: `0 0 ${state.canvasWidth} ${state.canvasHeight}`, onPointerDown: onCanvasDown, onPointerMove, onPointerUp, onPointerCancel: cancelGesture, onLostPointerCapture: () => { if (gestureRef.current) cancelGesture(); }, role: 'img', 'aria-label': 'MOSS 分镜画板。选择工具后拖动绘制，双击框编辑中文简述。' },
             h('rect', { width: state.canvasWidth, height: state.canvasHeight, fill: '#f8fafc' }),
             showOverlay ? h('image', { href: ov.dataUrl, x: 0, y: 0, width: state.canvasWidth, height: state.canvasHeight, preserveAspectRatio: ov.fitMode === 'contain' ? 'xMidYMid meet' : 'none', opacity: peekOriginal ? 1 : clamp(Number(ov.opacity ?? 0.72), 0.05, 1), style: { pointerEvents: 'none' } }) : null,
             ordered.map(({ item, index }) => itemSvg(item, index)),
             live.strokes.map(stroke => h('path', { key: stroke.id, d: pathFrom(stroke.points, false), stroke: stroke.color, strokeWidth: stroke.width, strokeLinecap: 'round', strokeLinejoin: 'round', fill: 'none', pointerEvents: 'none' })),
             polygon.length ? h('g', { pointerEvents: 'none' }, h('path', { d: pathFrom(polygon, false), fill: '#a78bfa12', stroke: '#8b5cf6', strokeWidth: 2 * displayScale, strokeDasharray: `${5 * displayScale} ${3 * displayScale}` }), polygon.map((p, i) => h('circle', { key: i, cx: p.x, cy: p.y, r: (i === 0 ? 6 : 4) * displayScale, fill: i === 0 ? '#38bdf8' : '#8b5cf6', stroke: '#fff', strokeWidth: displayScale }))) : null,
-            selectionSvg(), gestureSvg()), quickNote())),
+            selectionSvg(), gestureSvg()), quickNote())) : null),
         h('div', { className: 'moss-wb-canvas-help' }, h('span', null, `${state.canvasWidth} × ${state.canvasHeight} px (${(state.canvasWidth * state.canvasHeight / 1e6).toFixed(2)} MP)  |  abs_centralized yxyx`), h('span', { className: 'moss-wb-tool-hint' }, tool === 'select' ? '拖动移动 · 白点缩放 · 蓝点变形 · 双击简述' : tool === 'knife' ? '横穿边框切分 · Shift 吸附角度' : tool === 'polygon' ? '逐点点击 · Enter 闭合 · Esc 取消' : '拖动绘制 · Esc 取消'), h('span', { className: 'moss-wb-sync', role: 'status' }, syncStatus)));
 
     }
@@ -879,7 +908,8 @@ export function createMossWorkbenchComponents({ React, syncStateToServer, insert
             button('×', () => removeDocument(doc), { className: 'moss-wb-document-close', 'aria-label': `关闭并删除文档 ${doc.title}`, title: '关闭并删除此文档（需确认；不可撤销）' }));
         })),
         button('＋ 新建', createFile, { 'aria-label': '新建文档标签', title: '自动保存当前文档，新建空白文件' }),
-        button('💾 保存', saveFile, { 'aria-label': '保存当前文档', title: '保存文档 Ctrl / Cmd + S' }));
+        button('💾 保存', saveFile, { 'aria-label': '保存当前文档', title: '保存文档 Ctrl / Cmd + S' }),
+        h('div', { className: 'moss-wb-viewport-switch', role: 'group', 'aria-label': '视窗模式' }, [['2d', '🖼️ 2D 画布'], ['split', '🎬 3D/2D 双视窗'], ['3d', '🧊 3D 导演室']].map(([id, title]) => button(title, () => { commit({ ...state, viewportMode: id }); if (id !== '2d') setPropertiesTab('director'); }, { key: id, 'aria-pressed': (state.viewportMode || '2d') === id }))));
     }
     function renderContextOptions() {
       if (tool === 'knife') return h(React.Fragment, null, h('label', null, '间距', h('input', { type: 'range', min: 0, max: 36, value: state.gutterWidth ?? 16, 'aria-label': '分镜沟槽宽度', onChange: event => commit({ ...state, gutterWidth: Number(event.target.value) }, 'gutter') })), button('横切 0°', () => accessibleCut(0)), button('竖切 90°', () => accessibleCut(90)), button('斜切 −15°', () => accessibleCut(-15)));
@@ -898,7 +928,7 @@ export function createMossWorkbenchComponents({ React, syncStateToServer, insert
     function renderStudioInspector() {
       return h('aside', { className: 'moss-wb-studio-panels', 'aria-label': '属性与图层' },
         h('section', { className: 'moss-wb-scene-panel' }, h('label', null, h('span', null, '全局画面简述'), h('input', { value: state.globalNoteZh || '', placeholder: '一句话描述这幅画面…', 'aria-label': '全局画面简述', onChange: event => commit({ ...state, globalNoteZh: event.target.value }, 'global-note') })), h('div', { className: 'moss-wb-mode', role: 'group', 'aria-label': '画布模式' }, [['single', '单幅'], ['multi_panel', '多格'], ['collage', '拼贴']].map(([id, title]) => button(title, () => commit({ ...state, canvasMode: id }), { key: id, 'aria-pressed': state.canvasMode === id, className: state.canvasMode === id ? 'moss-wb-active' : '' })))),
-        h('section', { className: 'moss-wb-property-panel' }, h('div', { className: 'moss-wb-panel-heading' }, '属性', h('span', null, 'PROPERTIES')), h('div', { className: 'moss-wb-panel-tabs', role: 'tablist', onKeyDown: panelTabKeys, 'aria-label': '属性面板' }, [['selection', '当前选中框'], ['style', '风格与色板']].map(([id, title]) => button(title, () => setPropertiesTab(id), { key: id, role: 'tab', 'aria-selected': propertiesTab === id }))), h('div', { className: 'moss-wb-panel-content', role: 'tabpanel', 'aria-label': propertiesTab === 'selection' ? '当前选中框' : '风格与色板' }, propertiesTab === 'selection' ? selectedEditor() : globalEditor())),
+        h('section', { className: 'moss-wb-property-panel' }, h('div', { className: 'moss-wb-panel-heading' }, '属性', h('span', null, 'PROPERTIES')), h('div', { className: 'moss-wb-panel-tabs', role: 'tablist', onKeyDown: panelTabKeys, 'aria-label': '属性面板' }, [['selection', '当前选中框'], ['director', '🎥 3D与人偶'], ['style', '风格与色板']].map(([id, title]) => button(title, () => setPropertiesTab(id), { key: id, role: 'tab', 'aria-selected': propertiesTab === id }))), h('div', { className: 'moss-wb-panel-content', role: 'tabpanel', 'aria-label': propertiesTab === 'selection' ? '当前选中框' : propertiesTab === 'director' ? '3D与人偶' : '风格与色板' }, propertiesTab === 'selection' ? selectedEditor() : propertiesTab === 'director' ? h(DirectorProperties, directorProps) : globalEditor())),
         h('section', { className: 'moss-wb-layers-panel' }, h('div', { className: 'moss-wb-panel-heading' }, '图层', h('span', null, 'LAYERS')), h('div', { className: 'moss-wb-panel-tabs', role: 'tablist', onKeyDown: panelTabKeys, 'aria-label': '图层面板' }, [['layers', `图层列表 (${state.items.length})`], ['json', 'MOSS JSON']].map(([id, title]) => button(title, () => setLayersTab(id), { key: id, role: 'tab', 'aria-selected': layersTab === id }))), h('div', { className: 'moss-wb-panel-content', role: 'tabpanel', 'aria-label': layersTab === 'layers' ? '图层列表' : 'MOSS JSON' }, layersTab === 'layers' ? itemList() : outputEditor())));
     }
     let sizePreview = null, sizeError = '';
@@ -917,7 +947,7 @@ export function createMossWorkbenchComponents({ React, syncStateToServer, insert
         }
       }
     } },
-      h('style', null, MOSS_WORKBENCH_CSS),
+      h('style', null, MOSS_WORKBENCH_CSS + DIRECTOR_3D_CSS),
       h('input', { ref: fileInputRef, type: 'file', accept: 'image/*', style: { display: 'none' }, onChange: event => { const file = event.target.files?.[0]; if (file) loadOverlayFromFile(file); event.target.value = ''; } }),
       h('header', { className: 'moss-wb-options-bar' },
         h('span', { className: 'moss-wb-studio-brand', title: 'MOSS Studio' }, 'MOSS'),

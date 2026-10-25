@@ -1,5 +1,6 @@
 // Core MOSS-Image Geometry, Split-Knife Polygon Clipper, Linter & Prompt Compiler Engine
 // Pure ES module (zero Node/DOM dependencies) shared by Host Server & Browser Client.
+export * from './moss-3d.js';
 
 export const MOSS_LOCKED_NEGATIVE_PROMPT =
   "<|texture_and_style_neg|>, <|age_and_body_neg|>, <|universal_anatomy_neg|>";
