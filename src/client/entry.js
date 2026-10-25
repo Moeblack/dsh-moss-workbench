@@ -138,7 +138,23 @@ export function createClientPlugin(React) {
     return false;
   }
 
-  async function insertIntoComposer(promptText) {
+  function dataUrlToFile(dataUrl, fileName = "moss-workbench-canvas.png") {
+    try {
+      const m = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/.exec(dataUrl || "");
+      if (!m || typeof File === "undefined" || typeof atob !== "function") return null;
+      const mime = m[1];
+      const binary = atob(m[2]);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      return new File([bytes], fileName, { type: mime });
+    } catch {
+      return null;
+    }
+  }
+
+  async function insertIntoComposer(promptText, snapshotDataUrl) {
     if (!promptText) {
       throw new Error("生成的 MOSS 指令为空");
     }
@@ -147,6 +163,8 @@ export function createClientPlugin(React) {
     if (overlayOpenState) {
       setOverlayOpen(false);
     }
+
+    const pngFile = dataUrlToFile(snapshotDataUrl, "moss-workbench-canvas.png");
 
     // 1. Try DSH ConversationController / SessionInput service via activeSessionId
     try {
@@ -161,6 +179,17 @@ export function createClientPlugin(React) {
       if (conv?.input?.for && sessions?.scope && sid) {
         const sessionInput = conv.input.for(sessions.scope(sid));
         if (sessionInput && typeof sessionInput.setDraft === "function") {
+          if (pngFile && typeof conv.createDrafts === "function") {
+            try {
+              const drafts = conv.createDrafts(sid, [pngFile]);
+              const ids = Array.isArray(drafts) ? drafts.map((d) => d.id).filter(Boolean) : [];
+              if (ids.length > 0 && typeof sessionInput.addAttachments === "function") {
+                sessionInput.addAttachments(ids);
+              }
+            } catch {
+              // Ignore draft attachment error and still set text draft
+            }
+          }
           const existing = sessionInput.state?.getSnapshot?.()?.draft || "";
           const combined = existing.trim()
             ? `${existing.trim()}\n\n${promptText}`
@@ -178,6 +207,30 @@ export function createClientPlugin(React) {
     // 2. Try slot-injected inputActions.setDraft
     try {
       if (activeInputActions && typeof activeInputActions.setDraft === "function") {
+        const conv = currentCtx?.conversation || currentCtx?.get?.("conversation");
+        const sessions = currentCtx?.sessions || currentCtx?.get?.("sessions");
+        const sid =
+          activeSessionId ||
+          sessions?.current?.getSnapshot?.()?.id ||
+          document
+            ?.querySelector?.("[data-conversation-session]")
+            ?.getAttribute?.("data-conversation-session");
+        if (
+          pngFile &&
+          sid &&
+          typeof conv?.createDrafts === "function" &&
+          typeof activeInputActions.addAttachments === "function"
+        ) {
+          try {
+            const drafts = conv.createDrafts(sid, [pngFile]);
+            const ids = Array.isArray(drafts) ? drafts.map((d) => d.id).filter(Boolean) : [];
+            if (ids.length > 0) {
+              activeInputActions.addAttachments(ids);
+            }
+          } catch {
+            // Ignore attachment error
+          }
+        }
         activeInputActions.setDraft(promptText);
         switchConversationViewTab("chat");
         findComposerContentEditable()?.focus?.();

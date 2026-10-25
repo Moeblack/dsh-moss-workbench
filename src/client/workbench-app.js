@@ -667,9 +667,10 @@ export function createMossWorkbenchComponents({ React, syncStateToServer, insert
         if (result === null || result === false || result?.ok === false) throw new Error('服务器未确认画板同步');
         const nextRevision = Number(result?.serverRevision ?? result?.data?.serverRevision);
         if (Number.isFinite(nextRevision)) { revision = nextRevision; emit(); }
-        const inserted = await insertIntoComposer(compiled.agentPromptMarkdown);
+        const snapshotDataUrl = renderWorkbenchToDataUrl(state);
+        const inserted = await insertIntoComposer(compiled.agentPromptMarkdown, snapshotDataUrl);
         if (inserted === false) throw new Error('画板已同步，但未找到对话输入框；请打开对话后重试，或复制 MOSS JSON');
-        setSyncStatus('画板与 PNG 已同步'); notify('已同步画板草图并将 MOSS 分镜指令填入对话框！');
+        setSyncStatus('画板与 PNG 已同步'); notify('已同步画板草图并将人偶截图与 MOSS 分镜指令一并填入对话框！');
       } catch (e) { setError(`发送失败：${e.message}。画板已保留，可重试。`); }
       finally { sendingRef.current = false; setBusy(false); }
     }
